@@ -1,0 +1,138 @@
+name: Validation
+
+# Pull-request and push validation for SynthesisCore.
+#
+# This workflow runs on EVERY pull request and on pushes to master, and it needs
+# NO secrets: no signing keystore, no Telegram token, no PAT. It proves the code
+# compiles, the host telemetry tests pass, lint is clean, and an (unsigned)
+# release APK assembles. Signing and publication live in a separate, protected
+# workflow (build.yml / a future release.yml) so untrusted PR code never sees a
+# signing key.
+#
+# Canonical toolchain: JDK 21 (see gradle/gradle-daemon-jvm.properties and the
+# kotlin { jvmToolchain(21) } block in telemetry/build.gradle.kts). Keep this in
+# agreement with those files. NOTE: build.yml currently pins JDK 25 and disagrees
+# with the canonical toolchain; that is tracked as a follow-up.
+
+on:
+  pull_request:
+    branches: [ "master" ]
+  push:
+    branches: [ "master" ]
+  workflow_dispatch:
+
+# Least privilege: validation only reads the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  JAVA_VERSION: "21"
+
+jobs:
+  unit-tests:
+    name: Host telemetry tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      # TODO: pin these actions to full commit SHAs via Dependabot (see the
+      # dependency-update policy). Tags are used for now to match repo convention.
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      # The root build applies AGP to :app, so even :telemetry:test configures
+      # :app and needs an Android SDK present. setup-android provides it with no
+      # secrets.
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Validate Gradle wrapper
+        uses: gradle/actions/wrapper-validation@v4
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Run pure-JVM telemetry tests
+        run: ./gradlew --no-daemon --stacktrace :telemetry:test
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: telemetry-test-results
+          path: telemetry/build/test-results/test/*.xml
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### SynthesisCore host tests"
+            echo ""
+            echo "- Commit: \`${GITHUB_SHA}\`"
+            echo "- JDK: ${JAVA_VERSION}"
+            echo "- Task: \`:telemetry:test\` (pure JVM, no emulator, no signing secrets)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  build-lint:
+    name: Lint & unsigned build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # gitRevisionCount() in app/build.gradle.kts derives versionCode from
+          # the full history; a shallow clone would make it collapse to 1.
+          fetch-depth: 0
+
+      - name: Setup JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v5
+        with:
+          java-version: ${{ env.JAVA_VERSION }}
+          distribution: temurin
+          cache: gradle
+
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Android lint
+        run: ./gradlew --no-daemon --stacktrace lint
+
+      # The release build type declares no signingConfig, so assembleRelease
+      # produces an UNSIGNED APK and needs no keystore. This is the unsigned
+      # release-validation path required for secret-free PR builds.
+      - name: Assemble (debug + unsigned release)
+        run: ./gradlew --no-daemon --stacktrace assembleDebug assembleRelease
+
+      - name: Upload lint report
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: android-lint-report
+          path: app/build/reports/lint-results-*.html
+          retention-days: 7
+          if-no-files-found: warn
+
+      - name: Upload unsigned release APK
+        if: success()
+        uses: actions/upload-artifact@v7
+        with:
+          name: SynthesisCore-unsigned-${{ github.sha }}
+          path: app/build/outputs/apk/release/*.apk
+          retention-days: 7
+          if-no-files-found: error
