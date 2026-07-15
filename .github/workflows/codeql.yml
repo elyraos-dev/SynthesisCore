@@ -37,7 +37,8 @@ jobs:
       - name: Setup JDK
         uses: actions/setup-java@v5
         with:
-          java-version: '25'
+          # Canonical toolchain: JDK 21. Kept in sync by check-toolchain.sh.
+          java-version: '21'
           distribution: 'temurin'
           cache: gradle
 

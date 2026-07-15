@@ -10,9 +10,9 @@ name: Validation
 # signing key.
 #
 # Canonical toolchain: JDK 21 (see gradle/gradle-daemon-jvm.properties and the
-# kotlin { jvmToolchain(21) } block in telemetry/build.gradle.kts). Keep this in
-# agreement with those files. NOTE: build.yml currently pins JDK 25 and disagrees
-# with the canonical toolchain; that is tracked as a follow-up.
+# kotlin { jvmToolchain(21) } block in telemetry/build.gradle.kts). Every workflow
+# and the Kotlin toolchain are held in agreement by the `toolchain` job below,
+# which runs .github/scripts/check-toolchain.sh.
 
 on:
   pull_request:
@@ -33,6 +33,16 @@ env:
   JAVA_VERSION: "21"
 
 jobs:
+  toolchain:
+    name: Toolchain consistency
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Verify JDK toolchain declarations agree
+        run: ./.github/scripts/check-toolchain.sh
+
   unit-tests:
     name: Host telemetry tests
     runs-on: ubuntu-latest
