@@ -3,6 +3,15 @@ name: Build
 on:
   workflow_dispatch:
     inputs:
+      tag:
+        description: 'Release tag to publish (e.g. v1.0.1)'
+        required: true
+        default: 'v1.0.1'
+      prerelease:
+        description: 'Mark the release as a pre-release'
+        type: boolean
+        required: false
+        default: false
       reason:
         description: 'Reason for manual build trigger'
         required: false
@@ -11,6 +20,12 @@ on:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
+
+# Least privilege: this workflow builds, signs, and publishes a release, so it needs write
+# access to repository contents (to create the release and upload the APK asset). It needs
+# nothing more.
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -82,6 +97,48 @@ jobs:
             !app/build/outputs/apk/release/*-unsigned.apk
           retention-days: 30
           if-no-files-found: error
+
+      - name: Publish GitHub Release
+        if: success()
+        env:
+          # The default GITHUB_TOKEN is enough to create a release in this repository; no PAT.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Inputs are passed through the environment, never interpolated into the script body,
+          # so a crafted tag/reason cannot inject shell.
+          TAG: ${{ inputs.tag }}
+          PRERELEASE: ${{ inputs.prerelease }}
+          REASON: ${{ inputs.reason }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+
+          # The signed release APK is the one produced above that is NOT the -unsigned artifact.
+          APK=$(find app/build/outputs/apk/release -name '*.apk' ! -name '*-unsigned.apk' | head -1)
+          if [ -z "$APK" ]; then
+            echo "::error::No signed APK found to publish."
+            exit 1
+          fi
+
+          # Give the asset a stable, human-readable name instead of the Gradle default.
+          ASSET="SynthesisCore-${TAG}.apk"
+          cp "$APK" "$ASSET"
+
+          NOTES="Automated build from ${COMMIT}. Reason: ${REASON}"
+
+          # Idempotent: create the release the first time, then re-upload (clobber) on re-runs
+          # of the same tag rather than failing.
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "Release $TAG exists; uploading asset (clobber)."
+            gh release upload "$TAG" "$ASSET" --clobber
+          else
+            FLAGS=()
+            if [ "$PRERELEASE" = "true" ]; then FLAGS+=(--prerelease); fi
+            gh release create "$TAG" "$ASSET" \
+              --title "SynthesisCore ${TAG}" \
+              --notes "$NOTES" \
+              --target "$COMMIT" \
+              "${FLAGS[@]}"
+          fi
 
       - name: Make notify script executable
         if: always()
