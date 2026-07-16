@@ -17,11 +17,21 @@ plugins {
 dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     repositories {
-        google()
+        // Content-filtered so non-Android modules (":telemetry") never reach for Google's
+        // Maven at all: their dependencies resolve straight from Maven Central. This keeps
+        // `:telemetry:test` buildable — and fast — in environments that only carry a JDK.
+        google {
+            content {
+                includeGroupByRegex("com\\.android.*")
+                includeGroupByRegex("com\\.google.*")
+                includeGroupByRegex("androidx.*")
+            }
+        }
         mavenCentral()
     }
 }
 
 rootProject.name = "Synthesis Core"
 include(":app")
+include(":telemetry")
  

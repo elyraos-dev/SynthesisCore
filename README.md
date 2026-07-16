@@ -129,7 +129,7 @@ The diagram at the top of this page shows the full data flow. In short:
 
 The APK is self-contained and intended to be run via `app_process`, not installed normally. The GitHub Actions CI workflow builds and signs the APK automatically on every push to `master`.
 
-**Requirements:** JDK 25 · Android Gradle Plugin 9.x · `compileSdk 36`
+**Requirements:** JDK 21 · Android Gradle Plugin 9.x · Gradle 9.5.x · Kotlin 2.x · `compileSdk 36`
 
 ---
 

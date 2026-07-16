@@ -4,6 +4,8 @@
 /.idea/
 .DS_Store
 /build
+# Root-anchored /build misses subproject output (app/build, telemetry/build).
+build/
 /captures
 .externalNativeBuild
 .cxx

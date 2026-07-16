@@ -16,79 +16,50 @@
 
 package com.febricahyaa.synthesiscore
 
-import org.lsposed.hiddenapibypass.HiddenApiBypass
-
 import android.annotation.SuppressLint
 import android.app.ActivityManager
-import android.content.ComponentName
 import android.content.Context
-import android.os.Build
-import android.os.IBinder
 import android.media.AudioManager
 import android.os.BatteryManager
 import android.os.PowerManager
+import android.os.Process
+
+import com.febricahyaa.synthesiscore.telemetry.AtomicStatusWriter
+import com.febricahyaa.synthesiscore.telemetry.Provider
+import com.febricahyaa.synthesiscore.telemetry.ProviderResult
+import com.febricahyaa.synthesiscore.telemetry.TelemetryCollector
+import com.febricahyaa.synthesiscore.telemetry.ThermalSampler
+
+import org.lsposed.hiddenapibypass.HiddenApiBypass
 
 import java.io.File
-import java.io.FileOutputStream
-import java.lang.reflect.Field
 import java.lang.reflect.Method
 import java.nio.channels.FileChannel
 import java.nio.channels.FileLock
 import java.nio.file.StandardOpenOption
+import java.util.concurrent.atomic.AtomicBoolean
 
-// @SuppressLint("StaticFieldLeak") is intentional, this runs as a CLI tool via app_process,
-// not inside an Android Activity lifecycle, so there is no real Context leak risk here.
-
+/**
+ * SynthesisCore: the Android-side telemetry producer for Flux.
+ *
+ * Runs headless via `app_process`, not as an Activity — hence @SuppressLint("StaticFieldLeak"):
+ * there is no Activity lifecycle here and so no Context leak to speak of.
+ *
+ * Its entire job is to sample framework state and publish a versioned snapshot
+ * (see `TelemetryContract`) to a file that Flux watches. It owns no tuning policy, applies
+ * no profiles, and makes no decisions about performance.
+ */
 @SuppressLint("StaticFieldLeak", "DiscouragedPrivateApi", "PrivateApi")
 object MainKt {
+
+    /** Cadence for the cheap providers. Thermal runs slower, on its own interval. */
     private const val POLL_INTERVAL_MS = 500L
-    private const val PID_RETRY_INTERVAL_MS = 50L
-    private const val UNKNOWN_APP = "unknown 0 0"
-    private const val NONE_APP = "none 0 0"
-
-    // getThermalHeadroom() requires API 31+
-    private const val THERMAL_API_MIN_SDK = 31
-
-    private val FOREGROUND_METHOD_CANDIDATES = listOf(
-        "getFocusedRootTaskInfo",
-        "getFocusedRootTask",
-        "getFocusedTaskInfo",
-        "getFocusedStackInfo",
-        "getTopActivity",
-        "getTasks",
-        "getRunningTasks"
-    )
-
-    private val COMPONENT_NAME_FIELDS = listOf(
-        "topActivity",
-        "topActivityComponent",
-        "realActivity",
-        "baseActivity",
-        "origActivity",
-        "activity"
-    )
 
     private var systemContext: Context? = null
+    private val shuttingDown = AtomicBoolean(false)
 
-    private var activityTaskManager: Any? = null
-    private var foregroundMethod: Method? = null
-    private var powerManager: PowerManager? = null
-    private var activityManager: ActivityManager? = null
-    private var audioManager: AudioManager? = null
-    private var batteryManager: BatteryManager? = null
-    private var notificationManager: Any? = null
-    private var getZenModeMethod: Method? = null
-
-    // getThermalHeadroom() is available from API 31+; resolved once at init.
-    private var getThermalHeadroomMethod: Method? = null
-
-    private var bruteForceCandidates: List<Method>? = null
-
-    @Volatile
-    private var lastStatus = ""
-
-    private var outputPath = ""
-    private var lockFilePath: String? = null
+    private var lockChannel: FileChannel? = null
+    private var lockHandle: FileLock? = null
 
     @JvmStatic
     fun main(args: Array<String>) {
@@ -98,38 +69,139 @@ object MainKt {
             System.err.println("ERROR: output path is required.")
             return
         }
-        outputPath = args[0]
-
-        if (args.size >= 2) {
-            lockFilePath = args[1]
-        }
+        val outputPath = args[0]
+        val lockFilePath = args.getOrNull(1)
 
         bypassHiddenApiRestrictions()
-        setupSystemContext()
 
-        if (systemContext == null) {
+        systemContext = createSystemContext()
+        val ctx = systemContext
+        if (ctx == null) {
             System.err.println("ERROR: System context is null.")
             return
         }
 
-        if (!initializeServices()) {
-            System.err.println("ERROR: Failed to initialize services, exiting.")
+        if (lockFilePath != null && !acquireSingletonLock(lockFilePath)) {
+            // acquireSingletonLock has already explained why.
             return
         }
 
-        val lockChannel = acquireLock()
+        val collector = try {
+            buildCollector(ctx)
+        } catch (t: Throwable) {
+            System.err.println("ERROR: Failed to initialise providers: ${t.message}")
+            t.printStackTrace()
+            releaseLock()
+            return
+        }
 
-        val monitorThread = Thread.currentThread()
-        Runtime.getRuntime().addShutdownHook(Thread {
-            lockChannel?.close()
-            monitorThread.interrupt()
-        })
+        val writer = AtomicStatusWriter(File(outputPath), AndroidClock)
+        installShutdownHook()
 
-        runMonitorLoop()
+        runMonitorLoop(collector, writer)
+
+        releaseLock()
     }
 
-    private fun acquireLock(): FileChannel? {
-        val path = lockFilePath ?: return null
+    /**
+     * Wire the Android providers into the pure collector.
+     *
+     * A service that fails to resolve yields a `null` here, which its provider reports as
+     * [ProviderResult.Unsupported] rather than taking down initialisation. The old code
+     * cast every service non-null and returned false from `initializeServices()` on the
+     * first failure, so one uncooperative ROM service meant *no telemetry at all*.
+     */
+    private fun buildCollector(ctx: Context): TelemetryCollector {
+        val powerManager = ctx.systemServiceOrNull<PowerManager>(Context.POWER_SERVICE)
+        val activityManager = ctx.systemServiceOrNull<ActivityManager>(Context.ACTIVITY_SERVICE)
+        val audioManager = ctx.systemServiceOrNull<AudioManager>(Context.AUDIO_SERVICE)
+        val batteryManager = ctx.systemServiceOrNull<BatteryManager>(Context.BATTERY_SERVICE)
+
+        val (atm, foregroundMethod) = initActivityTaskManager()
+        val (notificationManager, zenMethod) = initNotificationManager()
+
+        val thermalSampler = ThermalSampler(
+            source = AndroidThermalSource(powerManager),
+            clock = AndroidClock,
+        )
+
+        return TelemetryCollector(
+            clock = AndroidClock,
+            daemonPid = Process.myPid(),
+            kernelIsGki = ReflectionSupport.isGkiKernel(),
+            foreground = ForegroundAppProvider(atm, foregroundMethod, activityManager),
+            screenAwake = ScreenProvider(powerManager),
+            batterySaver = BatterySaverProvider(powerManager),
+            chargingState = ChargingProvider(batteryManager),
+            thermal = Provider { thermalSampler.sample() },
+            audioActive = AudioProvider(audioManager),
+            zenMode = ZenProvider(notificationManager, zenMethod),
+            errorSink = { message -> System.err.println("WARN: $message") },
+        )
+    }
+
+    /**
+     * The monitor loop.
+     *
+     * Every provider failure is already contained by [TelemetryCollector], so the only
+     * failure that reaches here is the write itself. A write failure is logged once and
+     * retried on the next cycle — a full disk or a momentarily unwritable config directory
+     * is not a reason to exit and hand Flux a permanently missing producer.
+     */
+    private fun runMonitorLoop(collector: TelemetryCollector, writer: AtomicStatusWriter) {
+        var lastWriteError: String? = null
+
+        while (!shuttingDown.get() && !Thread.currentThread().isInterrupted) {
+            try {
+                val snapshot = collector.collect()
+                writer.writeIfNeeded(snapshot)
+                lastWriteError = null
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            } catch (t: Throwable) {
+                val message = "${t.javaClass.simpleName}: ${t.message}"
+                if (message != lastWriteError) {
+                    System.err.println("ERROR: failed to publish telemetry: $message")
+                    lastWriteError = message
+                }
+            }
+
+            try {
+                Thread.sleep(POLL_INTERVAL_MS)
+            } catch (_: InterruptedException) {
+                Thread.currentThread().interrupt()
+                break
+            }
+        }
+
+        System.err.println("INFO: SynthesisCore monitor loop exited.")
+    }
+
+    /**
+     * Release the lock and stop the loop on SIGTERM/SIGINT.
+     *
+     * The JVM runs shutdown hooks for both, and for a normal `System.exit`. Releasing the
+     * lock deterministically is what lets Flux's supervisor tell "SynthesisCore exited"
+     * from "SynthesisCore is wedged".
+     */
+    private fun installShutdownHook() {
+        val monitorThread = Thread.currentThread()
+        Runtime.getRuntime().addShutdownHook(
+            Thread {
+                shuttingDown.set(true)
+                monitorThread.interrupt()
+                releaseLock()
+            }
+        )
+    }
+
+    /**
+     * Take the singleton lock, or refuse to start.
+     *
+     * @return false when another instance already holds it, or the lock could not be taken.
+     */
+    private fun acquireSingletonLock(path: String): Boolean {
         return try {
             val file = File(path)
             file.parentFile?.mkdirs()
@@ -137,59 +209,50 @@ object MainKt {
             val channel = FileChannel.open(
                 file.toPath(),
                 StandardOpenOption.CREATE,
-                StandardOpenOption.WRITE
+                StandardOpenOption.WRITE,
             )
 
-            val lock: FileLock? = channel.tryLock()
+            val lock = channel.tryLock()
             if (lock == null) {
                 System.err.println("ERROR: Another instance holds the lock at '$path'.")
                 channel.close()
-                System.exit(1)
-                null
+                false
             } else {
-                channel
+                lockChannel = channel
+                lockHandle = lock
+                true
             }
         } catch (e: Exception) {
             System.err.println("ERROR: Failed to acquire lock at '$path': ${e.message}")
-            System.exit(1)
-            null
+            false
         }
     }
 
-    private fun runMonitorLoop() {
-        while (!Thread.currentThread().isInterrupted) {
-            try {
-                writeStatus()
-                Thread.sleep(POLL_INTERVAL_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                break
-            } catch (t: Throwable) {
-                t.printStackTrace()
-            }
-        }
+    private fun releaseLock() {
+        runCatching { lockHandle?.release() }
+        runCatching { lockChannel?.close() }
+        lockHandle = null
+        lockChannel = null
     }
 
-    private fun setupSystemContext() {
-        try {
+    private fun createSystemContext(): Context? {
+        return try {
             val looperClass = Class.forName("android.os.Looper")
             if (looperClass.getMethod("getMainLooper").invoke(null) == null) {
                 looperClass.getMethod("prepareMainLooper").invoke(null)
             }
 
             val activityThreadClass = Class.forName("android.app.ActivityThread")
-
             val thread = activityThreadClass.getMethod("systemMain").invoke(null)
                 ?: activityThreadClass.getMethod("currentActivityThread").invoke(null)
                 ?: error("Both systemMain() and currentActivityThread() returned null")
 
-            systemContext =
-                activityThreadClass.getMethod("getSystemContext").invoke(thread) as? Context
-                    ?: error("getSystemContext() returned null")
-
+            activityThreadClass.getMethod("getSystemContext").invoke(thread) as? Context
+                ?: error("getSystemContext() returned null")
         } catch (e: Exception) {
             System.err.println("ERROR: Failed to set up system context:")
             e.printStackTrace()
+            null
         }
     }
 
@@ -197,468 +260,49 @@ object MainKt {
         try {
             HiddenApiBypass.addHiddenApiExemptions("")
         } catch (e: Exception) {
-            // Hidden API bypass failed — features relying on private APIs
-            // (zen mode, ATM foreground detection) will degrade gracefully.
-            System.err.println("WARN: HiddenApiBypass failed, some features may be unavailable: ${e.message}")
+            // Zen mode and ATM foreground detection will report Unsupported/Failed rather
+            // than silently reporting wrong values.
+            System.err.println("WARN: HiddenApiBypass failed, some providers will be unavailable: ${e.message}")
         }
     }
 
-    private fun initializeServices(): Boolean {
+    /** @return the ATM binder proxy and its foreground method, or (null, null) if unavailable. */
+    private fun initActivityTaskManager(): Pair<Any?, Method?> {
         return try {
-            val ctx = systemContext ?: return false
-            powerManager = ctx.getSystemService(Context.POWER_SERVICE) as PowerManager
-            activityManager = ctx.getSystemService(Context.ACTIVITY_SERVICE) as ActivityManager
-            audioManager = ctx.getSystemService(Context.AUDIO_SERVICE) as AudioManager
-            batteryManager = ctx.getSystemService(Context.BATTERY_SERVICE) as BatteryManager
-            initActivityTaskManager()
-            initNotificationManager()
-            initThermalHeadroomMethod()
-            true
-        } catch (e: Exception) {
-            e.printStackTrace()
-            false
+            val serviceName = ReflectionSupport.atmServiceName()
+            val binder = ReflectionSupport.systemService(serviceName)
+                ?: error("ServiceManager returned null binder for '$serviceName'")
+            val atm = ReflectionSupport.bindInterface(
+                "${ReflectionSupport.atmInterfaceName()}\$Stub",
+                binder,
+            )
+            atm to ForegroundAppProvider.resolveForegroundMethod(atm)
+        } catch (t: Throwable) {
+            System.err.println("WARN: ActivityTaskManager unavailable: ${t.message}")
+            null to null
         }
     }
 
-    private fun initActivityTaskManager() {
-        val binder = getSystemService(resolveAtmServiceName())
-            ?: error("ServiceManager returned null binder for '${resolveAtmServiceName()}'")
-        val atm = bindInterface("${resolveAtmInterfaceName()}\$Stub", binder)
-        activityTaskManager = atm
-        foregroundMethod = findForegroundMethod(atm)
-    }
-
-    private fun initNotificationManager() {
-        val binder = getSystemService(Context.NOTIFICATION_SERVICE)
-            ?: error("ServiceManager returned null binder for notification service")
-        notificationManager = bindInterface("android.app.INotificationManager\$Stub", binder)
-        notificationManager?.let { manager ->
-            getDeclaredMethods(manager.javaClass).forEach { member ->
-                if (member.name == "getZenMode" && member.parameterTypes.isEmpty()) {
-                    getZenModeMethod = member
-                }
-            }
-        }
-    }
-
-    /**
-     * Resolve getThermalHeadroom() once at startup.
-     * Available on API 31+; silently skipped on older versions.
-     */
-    private fun initThermalHeadroomMethod() {
-        if (Build.VERSION.SDK_INT < THERMAL_API_MIN_SDK) return
-        try {
-            getThermalHeadroomMethod = PowerManager::class.java
-                .getMethod("getThermalHeadroom", Int::class.javaPrimitiveType)
-        } catch (e: NoSuchMethodException) {
-            System.err.println("WARN: getThermalHeadroom() not available on this build: ${e.message}")
-        }
-    }
-    
-    /**
-     * Returns true if running on a GKI (Generic Kernel Image) kernel.
-     *
-     * GKI kernels are identified by the "-androidXX-" segment in `uname -r`,
-     * e.g. "5.15.123-android13-8-00001-gabcdef". Vendor/OEM kernels carry
-     * device-specific suffixes instead (e.g. "-perf+", "-qcom-le") and
-     * return false.
-     */
-    private fun isGkiKernel(): Boolean {
+    /** @return the INotificationManager proxy and its getZenMode method, or (null, null). */
+    private fun initNotificationManager(): Pair<Any?, Method?> {
         return try {
-            val kernelVersion = System.getProperty("os.version") ?: ""
-            kernelVersion.contains(Regex("-android\\d+-"))
-        } catch (_: Exception) {
-            false
+            val binder = ReflectionSupport.systemService(Context.NOTIFICATION_SERVICE)
+                ?: error("ServiceManager returned null binder for notification service")
+            val manager = ReflectionSupport.bindInterface("android.app.INotificationManager\$Stub", binder)
+            val method = ReflectionSupport.declaredMethods(manager.javaClass)
+                .firstOrNull { it.name == "getZenMode" && it.parameterTypes.isEmpty() }
+            manager to method
+        } catch (t: Throwable) {
+            System.err.println("WARN: NotificationManager unavailable: ${t.message}")
+            null to null
         }
     }
 
-    private fun resolveAtmServiceName() =
-        if (Build.VERSION.SDK_INT >= 29) "activity_task" else Context.ACTIVITY_SERVICE
-
-    private fun resolveAtmInterfaceName() =
-        if (Build.VERSION.SDK_INT >= 29) "android.app.IActivityTaskManager" else "android.app.IActivityManager"
-
-    private fun getSystemService(name: String): IBinder? {
-        val serviceManager = Class.forName("android.os.ServiceManager")
-        return serviceManager.getMethod("getService", String::class.java)
-            .invoke(null, name) as? IBinder
-    }
-
-    private fun bindInterface(stubClassName: String, binder: IBinder): Any {
-        return Class.forName(stubClassName)
-            .getMethod("asInterface", IBinder::class.java)
-            .invoke(null, binder)
-            ?: error("asInterface returned null for $stubClassName")
-    }
-
-    private fun findForegroundMethod(atm: Any): Method? {
-        val methods = getDeclaredMethods(atm.javaClass).associateBy { it.name }
-
-        return FOREGROUND_METHOD_CANDIDATES
-            .mapNotNull { candidate -> methods[candidate] }
-            .find { method ->
-                method.parameterTypes.isEmpty() ||
-                        (method.parameterTypes.size == 1 && method.parameterTypes[0] == Int::class.java) ||
-                        method.name == "getTasks" || method.name == "getRunningTasks"
-            }
-            ?.apply { isAccessible = true }
-    }
-
-    private fun writeStatus() {
-        // Resolve the focused app, retrying if the PID is not yet available.
-        // Returns null if the timeout elapsed without a valid PID, in that case we
-        // skip this update so that stale "0 0" data is never written to the output file.
-        val focusedApp = waitForValidFocusedApp() ?: return
-
-        val currentStatus = buildStatus(focusedApp)
-        if (currentStatus == lastStatus) return
-
-        try {
-            val targetFile = File(outputPath)
-            targetFile.parentFile?.mkdirs()
-
-            // Write atomically: write to a .tmp sibling then rename.
-            // This prevents the C++ daemon from reading a partial file if we are
-            // interrupted mid-write (e.g. OOM-killed or process restart).
-            // inotify IN_CLOSE_WRITE fires on the rename target once the kernel
-            // has moved the file into place, so the watcher is correctly triggered.
-            val tmpFile = File("$outputPath.tmp")
-            FileOutputStream(tmpFile).use { fos ->
-                fos.write(currentStatus.toByteArray(Charsets.UTF_8))
-                fos.fd.sync()
-            }
-
-            if (!tmpFile.renameTo(targetFile)) {
-                // renameTo can fail across filesystems (shouldn't happen here, but be safe).
-                // Fall back to direct overwrite so the C++ side isn't starved of updates.
-                System.err.println("WARN: atomic rename failed for $outputPath, falling back to direct write")
-                FileOutputStream(targetFile).use { fos ->
-                    fos.write(currentStatus.toByteArray(Charsets.UTF_8))
-                    fos.fd.sync()
-                }
-            }
-
-            lastStatus = currentStatus
-        } catch (e: Exception) {
-            System.err.println("ERROR: writeStatus failed: ${e.message}")
-            e.printStackTrace()
-        }
-    }
-
-    /**
-     * Returns the focused-app string once its PID is known.
-     *
-     * When the foreground app was just launched it may not yet be visible to
-     * [ActivityManager.getRunningAppProcesses], causing [getPidUid] to return "0 0".
-     * Rather than writing that bogus value immediately, we poll every [PID_RETRY_INTERVAL_MS] ms
-     * until the process shows up or [POLL_INTERVAL_MS] elapses.
-     * If the timeout expires and the PID is still unknown, the app string with "0 0" is returned
-     * so the output file is still updated rather than silently skipped.
-     * Returns null only if interrupted.
-     */
-    private fun waitForValidFocusedApp(): String? {
-        var focusedApp = getFocusedAppInfo()
-        if (!hasMissingPid(focusedApp)) return focusedApp
-
-        val deadline = System.currentTimeMillis() + POLL_INTERVAL_MS
-        while (System.currentTimeMillis() < deadline) {
-            try {
-                Thread.sleep(PID_RETRY_INTERVAL_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-                return null
-            }
-            focusedApp = getFocusedAppInfo()
-            if (!hasMissingPid(focusedApp)) return focusedApp
-        }
-
-        // Timed out, write the app with 0 0 as PID/UID anyway.
-        System.err.println("WARN: PID still unresolved after ${POLL_INTERVAL_MS}ms for '$focusedApp'.")
-        return focusedApp
-    }
-
-    /**
-     * Returns true when [appInfo] represents a real foreground app whose PID could not
-     * yet be resolved (i.e. ends with " 0 0" but is not the sentinel [NONE_APP] value).
-     */
-    private fun hasMissingPid(appInfo: String): Boolean =
-        appInfo != NONE_APP && appInfo.endsWith(" 0 0")
-
-    private fun buildStatus(focusedApp: String): String {
-        val screenAwake = if (powerManager?.isInteractive == true) 1 else 0
-        val batterySaver = if (powerManager?.isPowerSaveMode == true) 1 else 0
-        val zenMode = getZenMode()
-        val chargingState = getChargingState()
-        val thermalStatus = getThermalStatus()
-        val audioActive = if (isAudioActive()) 1 else 0
-        val thermalApiAvailable = if (getThermalHeadroomMethod != null) 1 else 0
-        val kernelIsGki = if (isGkiKernel()) 1 else 0
-
-        return buildString {
-            appendLine("focused_app $focusedApp")
-            appendLine("screen_awake $screenAwake")
-            appendLine("battery_saver $batterySaver")
-            appendLine("zen_mode $zenMode")
-            appendLine("charging_state $chargingState")
-            appendLine("thermal_status $thermalStatus")
-            appendLine("audio_active $audioActive")
-            appendLine("thermal_api_available $thermalApiAvailable")
-            appendLine("kernel_is_gki $kernelIsGki")
-        }
-    }
-
-    /**
-     * Returns the current charging state as an integer:
-     *   0 = not charging / discharging
-     *   1 = charging (AC, USB, or wireless)
-     *
-     * Uses [BatteryManager.isCharging] which is available from API 23+.
-     * Falls back to 0 gracefully if the service is unavailable.
-     */
-    private fun getChargingState(): Int {
-        return try {
-            if (batteryManager?.isCharging == true) 1 else 0
-        } catch (_: Exception) {
-            0
-        }
-    }
-
-    /**
-     * Returns true if any audio stream is currently active (music, game audio, etc.).
-     *
-     * Checks [AudioManager.isMusicActive] which covers MediaPlayer/ExoPlayer/AudioTrack
-     * usage — the most common audio streams in mobile games.
-     * Falls back to false if the audio service is unavailable.
-     */
-    private fun isAudioActive(): Boolean {
-        return try {
-            audioManager?.isMusicActive == true
-        } catch (_: Exception) {
-            false
-        }
-    }
-
-    /**
-     * Returns a normalised thermal headroom value clamped to [0.0, 1.0].
-     *
-     * 1.0 = no thermal pressure (cool)
-     * 0.0 = device is at thermal limit (hot)
-     *
-     * Uses [PowerManager.getThermalHeadroom] with a 1-second forecast window,
-     * available from API 31+. Returns -1.00 on unsupported devices or on error.
-     */
-    private fun getThermalStatus(): String {
-        if (Build.VERSION.SDK_INT < THERMAL_API_MIN_SDK) return "-1.00"
-        return try {
-            val method = getThermalHeadroomMethod ?: return "-1.00"
-            val headroom = method.invoke(powerManager, 1) as? Float ?: return "-1.00"
-            // getThermalHeadroom() may return NaN on devices whose thermal HAL
-            // does not provide a valid headroom value even when the API is present.
-            // NaN.coerceIn() stays NaN, so we must guard explicitly.
-            if (headroom.isNaN()) return "-1.00"
-            val clamped = headroom.coerceIn(0f, 1f)
-            "%.2f".format(clamped)
-        } catch (_: Exception) {
-            "-1.00"
-        }
-    }
-
-    private fun getZenMode(): Int {
-        return try {
-            getZenModeMethod?.invoke(notificationManager) as? Int ?: 0
-        } catch (_: Exception) {
-            0
-        }
-    }
-
-    private fun getFocusedAppInfo(): String {
-        return try {
-            val result = invokeForegroundMethod() ?: return UNKNOWN_APP
-            if (result is List<*>) {
-                getFocusedAppFromList(result)
-            } else {
-                resolveAppInfoFromObject(result)
-            }
-        } catch (e: Exception) {
-            e.printStackTrace()
-            UNKNOWN_APP
-        }
-    }
-
-    private fun getFocusedAppFromList(list: List<*>): String {
-        if (list.isEmpty()) return NONE_APP
-        list.forEach { element ->
-            extractComponentName(element)?.let { return buildAppInfo(it.packageName) }
-        }
-        return resolveAppInfoFromObject(list[0]!!)
-    }
-
-    private fun resolveAppInfoFromObject(obj: Any): String {
-        extractComponentName(obj)?.let { return buildAppInfo(it.packageName) }
-        return findPackageLikeString(obj)?.let { buildAppInfo(it) } ?: UNKNOWN_APP
-    }
-
-    private fun invokeForegroundMethod(): Any? {
-        val method = foregroundMethod ?: return null
-        return tryInvokeForegroundMethod(method) ?: bruteForceForegroundMethod()
-    }
-
-    private fun tryInvokeForegroundMethod(method: Method): Any? {
-        val name = method.name
-        return try {
-            when {
-                name == "getTasks" || name == "getRunningTasks" -> {
-                    tryInvokeWithArgs(
-                        method,
-                        activityTaskManager!!,
-                        arrayOf(1),
-                        arrayOf(1, 0),
-                        arrayOf(1, false, false)
-                    )
-                }
-
-                method.parameterTypes.isEmpty() -> method.invoke(activityTaskManager)
-                else -> tryInvokeWithArgs(method, activityTaskManager!!, arrayOf(0))
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun tryInvokeWithArgs(method: Method, target: Any, vararg argSets: Array<Any>): Any? {
-        for (args in argSets) {
-            try {
-                return method.invoke(target, *args)
-            } catch (_: Exception) {
-                continue
-            }
-        }
-        return null
-    }
-
-    private fun bruteForceForegroundMethod(): Any? {
-        return try {
-            val candidates =
-                bruteForceCandidates ?: getDeclaredMethods(activityTaskManager!!.javaClass)
-                    .filter {
-                        val name = it.name.lowercase()
-                        name.contains("focus") || name.contains("top") || name.contains("task")
-                    }
-                    .onEach { it.isAccessible = true }
-                    .also { bruteForceCandidates = it }
-
-            candidates.firstNotNullOfOrNull { method ->
-                when {
-                    method.parameterTypes.isEmpty() ->
-                        tryInvokeQuietly { method.invoke(activityTaskManager) }
-
-                    method.parameterTypes.size == 1 && method.parameterTypes[0] == Int::class.java ->
-                        tryInvokeQuietly { method.invoke(activityTaskManager, 1) }
-
-                    else -> null
-                }
-            }
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private inline fun tryInvokeQuietly(block: () -> Any?): Any? {
-        return try {
-            block()
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun extractComponentName(obj: Any?): ComponentName? {
-        if (obj == null) return null
-        if (obj is ComponentName) return obj
-
-        COMPONENT_NAME_FIELDS.forEach { fieldName ->
-            getComponentNameFromField(obj, obj.javaClass, fieldName)?.let { return it }
-        }
-
-        return scanHierarchyForComponentName(obj)
-    }
-
-    private fun getComponentNameFromField(
-        obj: Any,
-        cls: Class<*>,
-        fieldName: String
-    ): ComponentName? {
-        return try {
-            val field = cls.getDeclaredField(fieldName).apply { isAccessible = true }
-            field.get(obj) as? ComponentName
-        } catch (_: Exception) {
-            null
-        }
-    }
-
-    private fun scanHierarchyForComponentName(obj: Any): ComponentName? {
-        var cls: Class<*>? = obj.javaClass
-        while (cls != null && cls != Any::class.java) {
-            getInstanceFields(cls).forEach { field ->
-                try {
-                    field.isAccessible = true
-                    val value = field.get(obj)
-                    if (value is ComponentName) return value
-                } catch (_: Exception) {
-                }
-            }
-            cls = cls.superclass
-        }
-        return null
-    }
-
-    private fun findPackageLikeString(obj: Any?): String? {
-        if (obj == null) return null
-        extractPackageName(obj.toString())?.let { return it }
-
-        getInstanceFields(obj.javaClass).forEach { field ->
-            if (field.type == String::class.java) {
-                try {
-                    field.isAccessible = true
-                    (field.get(obj) as? String)?.let { str ->
-                        extractPackageName(str)?.let { return it }
-                    }
-                } catch (_: Exception) {
-                }
-            }
-        }
-        return null
-    }
-
-    private fun extractPackageName(input: String?): String? {
-        if (input == null || input.indexOf('.') <= 0) return null
-        val normalized = input.lowercase().replace(Regex("[^a-z0-9._-]"), " ")
-        return normalized.split(Regex("\\s+")).find {
-            it.contains(".") && it.matches(Regex("[a-z0-9]+(\\.[a-z0-9]+)+"))
-        }
-    }
-
-    private fun buildAppInfo(pkg: String): String {
-        val pidUid = getPidUid(pkg)
-        return "$pkg $pidUid"
-    }
-
-    private fun getPidUid(pkg: String): String {
-        return try {
-            activityManager?.runningAppProcesses
-                ?.find { it.processName == pkg || it.pkgList?.contains(pkg) == true }
-                ?.let { "${it.pid} ${it.uid}" }
-                ?: "0 0"
-        } catch (e: Exception) {
-            System.err.println("WARN: getPidUid failed for '$pkg': ${e.message}")
-            "0 0"
-        }
-    }
-
-    private fun getDeclaredMethods(cls: Class<*>): List<Method> {
-        return HiddenApiBypass.getDeclaredMethods(cls).filterIsInstance<Method>()
-    }
-
-    private fun getInstanceFields(cls: Class<*>): List<Field> {
-        return HiddenApiBypass.getInstanceFields(cls).filterIsInstance<Field>()
+    /** getSystemService without the unchecked cast blowing up initialisation on odd ROMs. */
+    private inline fun <reified T> Context.systemServiceOrNull(name: String): T? = try {
+        getSystemService(name) as? T
+    } catch (t: Throwable) {
+        System.err.println("WARN: system service '$name' unavailable: ${t.message}")
+        null
     }
 }

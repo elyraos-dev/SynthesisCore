@@ -54,5 +54,10 @@ android {
 }
 
 dependencies {
+    // The telemetry contract, encoder, thermal sampling policy and atomic writer.
+    // Pure JVM, no Android APIs — and therefore host-testable via `:telemetry:test`.
+    implementation(project(":telemetry"))
     implementation(libs.hiddenapibypass)
+
+    testImplementation(libs.junit)
 }
